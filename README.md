@@ -17,7 +17,6 @@ I wanted a single dashboard I could check in the morning and trust to be current
 - **No sense of where things are happening.** A map makes it obvious which countries are in the news.
 - **Urgent items get buried.** An actively exploited bug looks the same as a product announcement in most
   feeds. Here it is flagged.
-- **Context switching.** I wanted to read the story right beside the map, not lose my place.
 
 ## What it does
 
