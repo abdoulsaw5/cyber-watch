@@ -140,6 +140,14 @@ for example:
 Keep one worker, because the feed cache lives in memory. Rate limit `POST /api/refresh` and
 `/api/article/<id>` before sharing the link widely.
 
+
+
+## Updates
+
+| Date | Update |
+| --- | --- |
+| Nov 5, 2026 | First public release. Repo published on GitHub and deployed live on Render. |
+| Nov 7, 2026 | Upgraded the Render compute plan so the site stays running with no sleep or boot-up downtime, and gets more CPU. |
 ## Next features
 
 ### In progress
