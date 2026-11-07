@@ -140,12 +140,30 @@ for example:
 Keep one worker, because the feed cache lives in memory. Rate limit `POST /api/refresh` and
 `/api/article/<id>` before sharing the link widely.
 
-## Roadmap
+## Next features
 
-- Search across all stories
-- More countries and a per-country detail view
-- Fix or replace the few sources that block automated readers
-- Ambient music (planned)
+### In progress
+
+- **Rate limiting.** Per-visitor limits on the article reader, the refresh button and the news endpoint, plus a
+  site-wide cooldown on refresh and a cap on simultaneous article downloads. Visitors who go over the limit see
+  a friendly message instead of an error.
+- **Stronger SSRF protection.** The reader already fetches only links from its own feed cache. Next, it will
+  also check every redirect and refuse any address that points to a private or internal network.
+- **Health check endpoint.** A lightweight `/healthz` route so the host can confirm the app is running and
+  restart it if it stops responding.
+- **Security headers.** Adding HSTS to force HTTPS, on top of the existing Content-Security-Policy.
+- **Faster API.** Compressing and briefly caching the news response so many visitors cost the server one
+  computation.
+
+### Planned
+
+- **Search** across all stories.
+- **Better classification.** Measure the keyword rules against hand-labeled stories and try a stronger
+  classifier.
+- **More countries** and a per-country detail view.
+- **Fix or replace** the few sources that block automated readers.
+- **Custom domain** for the live site.
+- **Ambient music** with a mute button.
 
 ## Credits
 
