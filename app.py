@@ -6,7 +6,9 @@ tracks per-source health, and extracts article text for the in-app reader.
 
 Run:  python app.py   then open the address it prints.
 """
+import gzip
 import hashlib
+import ipaddress
 import os
 import re
 import socket
@@ -15,13 +17,15 @@ import time
 import warnings
 from calendar import timegm
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import OrderedDict
 from datetime import datetime, timezone
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import feedparser
 import requests
 from bs4 import BeautifulSoup, MarkupResemblesLocatorWarning
-from flask import Flask, abort, jsonify, request, send_from_directory
+from flask import Flask, Response, abort, g, jsonify, request, send_from_directory
+from flask_limiter import Limiter
 from readability import Document
 
 from feeds import (AI_TERMS, AISEC_SEC_TERMS, CATEGORY_DESC, CATEGORY_LABELS, COMMUNITY_TERMS,
@@ -29,7 +33,8 @@ from feeds import (AI_TERMS, AISEC_SEC_TERMS, CATEGORY_DESC, CATEGORY_LABELS, CO
 
 warnings.filterwarnings("ignore", category=MarkupResemblesLocatorWarning)
 
-CACHE_TTL = 600  # seconds between feed refreshes
+CACHE_TTL = int(os.environ.get("REFRESH_SECS", 600))  # seconds between feed refreshes
+MIN_RETRY_SECS = 60  # a failed refresh is not retried more often than this
 DEFAULT_PER_FEED = 15
 MAX_ITEMS = 1500
 MAX_WORKERS = 8                 # fewer parallel requests = fewer timeouts on home connections
@@ -37,18 +42,66 @@ CONNECT_TIMEOUT = 8
 READ_TIMEOUT = 20
 RETRY_READ_TIMEOUT = 40         # second attempt is more patient
 RETRY_DELAY = 1.5
-ARTICLE_TIMEOUT = 12
-ARTICLE_MAX_BYTES = 3_000_000
+ARTICLE_TIMEOUT = 6              # connect/read timeout per socket operation
+ARTICLE_DEADLINE = 10            # hard limit for the whole download, in seconds
+ARTICLE_MAX_BYTES = 1_500_000
+ARTICLE_CACHE_MAX = 200
+ARTICLE_CACHE_OK_SECS = 6 * 3600
+ARTICLE_CACHE_FALLBACK_SECS = 300
+# --- abuse protection and hardening
+TRUSTED_PROXIES = int(os.environ.get("TRUSTED_PROXIES", 1))  # proxies in front of the app that append to X-Forwarded-For
+LIMIT_NEWS = "60 per minute"
+LIMIT_ARTICLE = "20 per minute;200 per hour"
+LIMIT_REFRESH = "3 per 10 minutes"
+REFRESH_COOLDOWN_SECS = 60       # site-wide: no manual refresh right after any refresh attempt
+ARTICLE_MAX_CONCURRENT = 3       # simultaneous article downloads, so slow sites cannot use every thread
+ARTICLE_QUEUE_WAIT = 2           # seconds a request waits for a free download slot
+MAX_REDIRECTS = 3
+ALLOWED_PORTS = {None, 80, 443}
+ALLOW_PRIVATE_FETCH = os.environ.get("CYBERWATCH_ALLOW_PRIVATE") == "1"  # tests only
+NEWS_CACHE_SECS = 2
 USER_AGENT = "Mozilla/5.0 (compatible; CyberWatch/1.2; personal RSS reader)"
 ACCEPT = "application/rss+xml, application/atom+xml, application/xml;q=0.9, text/xml;q=0.8, */*;q=0.5"
 TOTAL_SOURCES = sum(len(v) for v in FEEDS.values())
 
 app = Flask(__name__, static_folder="static", static_url_path="/static")
 app.json.sort_keys = False  # keep tab order exactly as defined in feeds.py
+app.config["RATELIMIT_HEADERS_ENABLED"] = True
+
+
+def client_ip():
+    """The visitor's address, for rate limiting.
+
+    Behind a proxy every connection looks like it comes from the proxy. The proxy appends the
+    real address to X-Forwarded-For, so we take the entry that many trusted proxies from the end.
+    Anything a visitor writes into that header sits earlier in the list and is ignored.
+    """
+    parts = [p.strip() for p in request.headers.get("X-Forwarded-For", "").split(",") if p.strip()]
+    if TRUSTED_PROXIES > 0 and len(parts) >= TRUSTED_PROXIES:
+        return parts[-TRUSTED_PROXIES]
+    return request.remote_addr or "unknown"
+
+
+@app.after_request
+def _own_retry_after(resp):
+    # Registered before the limiter, so it runs after the limiter's own header injection, which
+    # would otherwise overwrite a view's Retry-After with the rate-limit window.
+    wait = getattr(g, "retry_after", None)
+    if wait is not None:
+        resp.headers["Retry-After"] = str(wait)
+    return resp
+
+
+limiter = Limiter(client_ip, app=app, storage_uri="memory://", default_limits=[])
 
 _lock = threading.Lock()
 _cache = {"items": [], "updated": 0.0, "health": {}}
 _refreshing = False
+_last_attempt = 0.0
+_scheduler_started = False
+_news_cache = {}
+_news_lock = threading.Lock()
+_article_slots = threading.BoundedSemaphore(ARTICLE_MAX_CONCURRENT)
 
 # ------------------------------------------------------------ classification
 _RE = {
@@ -201,6 +254,11 @@ def _fetch_with_retry(category, feed):
         return _fetch_feed(category, feed, (CONNECT_TIMEOUT + 4, RETRY_READ_TIMEOUT))
 
 
+def _invalidate_news():
+    with _news_lock:
+        _news_cache.clear()
+
+
 def _publish(items, health, final=False):
     now = time.time()
     seen, unique = set(), []
@@ -216,6 +274,7 @@ def _publish(items, health, final=False):
         _cache["health"] = dict(health)
         if final:
             _cache["updated"] = time.time()
+    _invalidate_news()
 
 
 def _do_refresh():
@@ -242,26 +301,66 @@ def _do_refresh():
                     health[f["name"]] = {"ok": False, "error": _short_error(exc), "count": 0, "category": cat}
                 if progressive:
                     _publish(items, health)
-        _publish(items, health, final=True)
+        if items or not _cache["items"]:
+            _publish(items, health, final=True)
+        else:
+            # Every feed failed (for example a network blip). Keep the stories we already
+            # have and record why, instead of replacing the page with nothing.
+            with _lock:
+                _cache["health"] = dict(health)
+            _invalidate_news()
     finally:
         with _lock:
             _refreshing = False
+        _invalidate_news()
 
 
 def start_refresh():
     """Start a background refresh unless one is already running."""
-    global _refreshing
+    global _refreshing, _last_attempt
     with _lock:
         if _refreshing:
             return False
         _refreshing = True
+        _last_attempt = time.time()
+    _invalidate_news()
     threading.Thread(target=_do_refresh, daemon=True).start()
     return True
 
 
 def _ensure_fresh():
-    if time.time() - _cache["updated"] > CACHE_TTL:
+    """Safety net: if the timer below somehow missed, a visit still triggers a refresh."""
+    now = time.time()
+    if now - _cache["updated"] > CACHE_TTL and now - _last_attempt > MIN_RETRY_SECS:
         start_refresh()
+
+
+def _scheduler_loop():
+    while True:
+        try:
+            start_refresh()
+        except Exception:  # noqa: BLE001  the timer must never die
+            pass
+        time.sleep(CACHE_TTL)
+
+
+def start_scheduler():
+    """Refresh the feeds on a timer, so visitors always find recent stories.
+
+    Runs once per process. Set CYBERWATCH_NO_SCHEDULER=1 to turn it off (used by tests).
+    """
+    global _scheduler_started
+    if os.environ.get("CYBERWATCH_NO_SCHEDULER") == "1":
+        return False
+    with _lock:
+        if _scheduler_started:
+            return False
+        _scheduler_started = True
+    threading.Thread(target=_scheduler_loop, name="feed-scheduler", daemon=True).start()
+    return True
+
+
+start_scheduler()
 
 
 # -------------------------------------------------------------------- routes
@@ -274,6 +373,25 @@ def _headers(resp):
         "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; "
         "media-src 'self'; connect-src 'self'; frame-ancestors 'none'"
     )
+    if request.is_secure or request.headers.get("X-Forwarded-Proto", "") == "https":
+        resp.headers["Strict-Transport-Security"] = "max-age=31536000"
+    return resp
+
+
+@app.errorhandler(429)
+def _too_many(_e):
+    resp = jsonify({"error": "rate_limited", "message": "Too many requests. Please slow down a little."})
+    resp.status_code = 429
+    return resp
+
+
+@app.get("/healthz")
+def healthz():
+    """Cheap liveness check for the host and uptime monitors. Never touches the network."""
+    with _lock:
+        stories, updated = len(_cache["items"]), _cache["updated"]
+    resp = jsonify({"ok": True, "stories": stories, "updated": updated or None})
+    resp.headers["Cache-Control"] = "no-store"
     return resp
 
 
@@ -282,10 +400,7 @@ def index():
     return send_from_directory("static", "index.html")
 
 
-@app.get("/api/news")
-def api_news():
-    _ensure_fresh()
-    category = request.args.get("category", "all")
+def _news_payload(category):
     with _lock:
         items = list(_cache["items"])
         updated = _cache["updated"]
@@ -293,7 +408,7 @@ def api_news():
         refreshing = _refreshing
     if category not in ("all", "map"):
         items = [i for i in items if category in i["categories"]]
-    return jsonify({
+    return {
         "items": items,
         "updated": datetime.fromtimestamp(updated, timezone.utc).isoformat() if updated else None,
         "refreshing": refreshing,
@@ -303,15 +418,139 @@ def api_news():
         "desc": CATEGORY_DESC,
         "countries": [{"name": n, "iso": m["iso"], "flag": m["flag"], "lat": m["lat"], "lon": m["lon"]}
                       for n, m in COUNTRIES.items()],
-    })
+    }
+
+
+def _news_body(category, want_gzip):
+    """JSON for /api/news, built once per couple of seconds and compressed on demand."""
+    known = category in ("all", "map") or category in CATEGORY_LABELS
+    now = time.time()
+    hit = None
+    if known:
+        with _news_lock:
+            entry = _news_cache.get(category)
+            if entry and entry["exp"] > now:
+                hit = entry
+    if hit is None:
+        hit = {"exp": now + NEWS_CACHE_SECS, "raw": app.json.dumps(_news_payload(category)).encode("utf-8"), "gz": None}
+        if known:
+            with _news_lock:
+                _news_cache[category] = hit
+    if want_gzip:
+        if hit["gz"] is None:
+            hit["gz"] = gzip.compress(hit["raw"], 5)
+        return hit["gz"], True
+    return hit["raw"], False
+
+
+@app.get("/api/news")
+@limiter.limit(lambda: LIMIT_NEWS)
+def api_news():
+    _ensure_fresh()
+    category = request.args.get("category", "all")
+    body, zipped = _news_body(category, "gzip" in request.headers.get("Accept-Encoding", ""))
+    resp = Response(body, mimetype="application/json")
+    resp.headers["Vary"] = "Accept-Encoding"
+    if zipped:
+        resp.headers["Content-Encoding"] = "gzip"
+    return resp
 
 
 @app.post("/api/refresh")
+@limiter.limit(lambda: LIMIT_REFRESH)
 def api_refresh():
+    # One shared cooldown for everybody: refreshing re-downloads every feed, so it must not
+    # be repeatable on demand. The timer already refreshes on its own every few minutes.
+    if time.time() - _last_attempt < REFRESH_COOLDOWN_SECS:
+        return jsonify({"started": False, "reason": "cooldown"})
     return jsonify({"started": start_refresh()})
 
 
+# ---- safe downloading for the in-app reader
+def _host_is_public(host):
+    """True only if every address the host name resolves to is a normal public internet address."""
+    try:
+        infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+    except (OSError, UnicodeError):
+        return False
+    if not infos:
+        return False
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0].split("%")[0])
+        if ip.version == 6 and ip.ipv4_mapped:
+            ip = ip.ipv4_mapped
+        if not ip.is_global:
+            return False
+    return True
+
+
+def _url_allowed(url):
+    try:
+        parts = urlparse(url)
+        port = parts.port
+    except ValueError:
+        return False
+    if parts.scheme not in ("http", "https") or not parts.hostname or parts.username or parts.password:
+        return False
+    if ALLOW_PRIVATE_FETCH:
+        return True
+    return port in ALLOWED_PORTS and _host_is_public(parts.hostname)
+
+
+def _download_limited(url):
+    """Download a page with a hard total time limit, even if the site trickles data.
+
+    The download runs in a helper thread. If it is still going after
+    ARTICLE_DEADLINE seconds, the caller stops waiting and falls back to the
+    feed summary. The helper thread ends itself at its next chunk.
+    """
+    box = {"chunks": [], "err": None, "resp": None, "encoding": "utf-8"}
+
+    def work():
+        try:
+            current = url
+            for _ in range(MAX_REDIRECTS + 1):
+                # Every hop is checked, so a redirect cannot lead the server to an internal address.
+                if not _url_allowed(current):
+                    raise ValueError("blocked address")
+                r = requests.get(current, headers={"User-Agent": USER_AGENT}, timeout=ARTICLE_TIMEOUT,
+                                 stream=True, allow_redirects=False)
+                box["resp"] = r
+                if r.is_redirect and r.headers.get("Location"):
+                    current = urljoin(current, r.headers["Location"])
+                    r.close()
+                    continue
+                with r:
+                    r.raise_for_status()
+                    box["encoding"] = r.encoding or "utf-8"
+                    size = 0
+                    for chunk in r.iter_content(chunk_size=8192):
+                        box["chunks"].append(chunk)
+                        size += len(chunk)
+                        if size >= ARTICLE_MAX_BYTES or box.get("stop"):
+                            break
+                return
+            raise ValueError("too many redirects")
+        except Exception as e:  # noqa: BLE001
+            box["err"] = e
+
+    t = threading.Thread(target=work, daemon=True)
+    t.start()
+    t.join(ARTICLE_DEADLINE)
+    if t.is_alive():
+        box["stop"] = True  # the helper thread gives up at its next chunk
+        raise TimeoutError("article download too slow")
+    if box["err"]:
+        raise box["err"]
+    return b"".join(box["chunks"]).decode(box["encoding"], errors="replace")
+
+
+_article_cache = OrderedDict()
+_article_lock = threading.Lock()
+
+
 @app.get("/api/article/<item_id>")
+@limiter.limit(lambda: LIMIT_ARTICLE)
 def api_article(item_id):
     """Extract readable text for the in-app reader.
 
@@ -327,25 +566,38 @@ def api_article(item_id):
     parts = urlparse(item["link"])
     if parts.scheme not in ("http", "https"):
         abort(400)
+    now = time.time()
+    with _article_lock:
+        hit = _article_cache.get(item_id)
+        if hit and hit[0] > now:
+            _article_cache.move_to_end(item_id)
+            return jsonify(hit[1])
     result = {"id": item["id"], "title": item["title"], "link": item["link"],
               "source": item["source"], "paragraphs": [], "fallback": False}
+    if not _article_slots.acquire(timeout=ARTICLE_QUEUE_WAIT):
+        resp = jsonify({"error": "busy", "message": "The reader is busy. Try again in a few seconds."})
+        resp.status_code = 503
+        g.retry_after = 5
+        return resp
     try:
-        with requests.get(item["link"], headers={"User-Agent": USER_AGENT}, timeout=ARTICLE_TIMEOUT,
-                          stream=True) as r:
-            r.raise_for_status()
-            body = r.raw.read(ARTICLE_MAX_BYTES, decode_content=True)
-            encoding = r.encoding or "utf-8"
-        html = body.decode(encoding, errors="replace")
+        html = _download_limited(item["link"])
         content = Document(html).summary(html_partial=True)
         soup = BeautifulSoup(content, "html.parser")
         paras = [t.get_text(" ", strip=True) for t in soup.find_all(["p", "h2", "h3", "li"])]
         result["paragraphs"] = [p for p in paras if len(p) > 25][:60]
     except Exception:
         pass
+    finally:
+        _article_slots.release()
     if not result["paragraphs"]:
         # Many sites block scraping. Fall back to the feed summary.
         result["fallback"] = True
         result["paragraphs"] = [item["summary"]] if item["summary"] else []
+    ttl = ARTICLE_CACHE_FALLBACK_SECS if result["fallback"] else ARTICLE_CACHE_OK_SECS
+    with _article_lock:
+        _article_cache[item_id] = (time.time() + ttl, result)
+        while len(_article_cache) > ARTICLE_CACHE_MAX:
+            _article_cache.popitem(last=False)
     return jsonify(result)
 
 
@@ -369,5 +621,4 @@ def _pick_port():
 if __name__ == "__main__":
     port = _pick_port()
     print(f"\n  Cyber Watch running. Open http://127.0.0.1:{port}\n")
-    start_refresh()
     app.run(host="127.0.0.1", port=port, debug=False)
