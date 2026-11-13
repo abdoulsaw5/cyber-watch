@@ -1,6 +1,7 @@
-flask
-feedparser
-requests
-beautifulsoup4
-readability-lxml
-gunicorn
+flask>=3.1,<4
+flask-limiter>=3.8,<5
+feedparser>=6.0,<7
+requests>=2.32,<3
+beautifulsoup4>=4.12,<5
+readability-lxml>=0.8,<1
+gunicorn>=23,<27; sys_platform != "win32"
