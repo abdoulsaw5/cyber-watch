@@ -373,21 +373,34 @@
   $("closehealth").addEventListener("click", () => $("health").classList.add("hidden"));
 
   // ---------- reader ----------
+  let readerToken = 0;
   async function openReader(it) {
     $("reader").classList.remove("hidden");
     $("rsource").textContent = `${it.source}  \u00b7  ${ago(it.ts)}`;
     $("rtitle").textContent = it.title;
     $("openorig").href = it.link;
     const body = $("rtext");
-    body.textContent = "Loading article...";
+    body.textContent = "";
+    if (it.summary) body.appendChild(el("p", "", it.summary));
+    const note = el("div", "note", "Loading the full article...");
+    body.appendChild(note);
+    const mine = ++readerToken;
     try {
       const r = await fetch(`/api/article/${encodeURIComponent(it.id)}`);
+      if (mine !== readerToken) return;
+      if (r.status === 429 || r.status === 503) {
+        note.textContent = r.status === 429
+          ? "You are opening stories quickly. Wait a few seconds and try again, or use Open on site."
+          : "The reader is busy right now. Try again in a few seconds, or use Open on site.";
+        return;
+      }
       if (r.status === 404) {
         body.textContent = "This story has rotated out of the live feed, so no preview is available here. Use Open on site.";
         return;
       }
       if (!r.ok) throw new Error(r.status);
       const data = await r.json();
+      if (mine !== readerToken) return;
       body.textContent = "";
       if (data.fallback) {
         body.appendChild(el("div", "note", "This site did not allow full text extraction. Showing the feed summary. Use Open on site to read the full article."));
@@ -395,6 +408,7 @@
       if (!data.paragraphs.length) body.appendChild(el("p", "", "No preview available. Use Open on site."));
       for (const p of data.paragraphs) body.appendChild(el("p", "", p));
     } catch (e) {
+      if (mine !== readerToken) return;
       body.textContent = "Could not load the article here. Use Open on site.";
     }
     document.querySelector(".reader-body").scrollTop = 0;
@@ -412,6 +426,11 @@
     clearTimeout(pollTimer);
     try {
       const r = await fetch("/api/news");
+      if (r.status === 429) {
+        $("updated").textContent = "Busy, retrying shortly";
+        pollTimer = setTimeout(load, 20000);
+        return;
+      }
       const data = await r.json();
       state.items = data.items;
       state.labels = { ...data.labels, saved: "Saved" };
@@ -444,7 +463,14 @@
 
   $("refresh").addEventListener("click", async () => {
     $("updated").textContent = "Refreshing";
-    try { await fetch("/api/refresh", { method: "POST" }); } catch (e) { /* ignore */ }
+    try {
+      const r = await fetch("/api/refresh", { method: "POST" });
+      if (r.status === 429) {
+        $("updated").textContent = "Please wait a few minutes before refreshing again";
+        setTimeout(load, 4000);
+        return;
+      }
+    } catch (e) { /* ignore */ }
     load();
   });
 
