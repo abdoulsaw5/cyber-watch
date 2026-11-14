@@ -35,20 +35,21 @@ warnings.filterwarnings("ignore", category=MarkupResemblesLocatorWarning)
 
 CACHE_TTL = int(os.environ.get("REFRESH_SECS", 600))  # seconds between feed refreshes
 MIN_RETRY_SECS = 60  # a failed refresh is not retried more often than this
+FEED_MAX_BYTES = 1_500_000  # a feed larger than this is cut off (its newest entries come first)
 MAX_AGE_DAYS = int(os.environ.get("MAX_AGE_DAYS", 14))  # older stories are not shown
 REFRESH_DEADLINE = 240  # a refresh that is still running after this many seconds is cut off
 START_DELAY_SECS = float(os.environ.get("START_DELAY_SECS", 2))  # wait after startup before the first refresh
 DEFAULT_PER_FEED = 15
 MAX_ITEMS = 1500
-MAX_WORKERS = 8                 # fewer parallel requests = fewer timeouts on home connections
+MAX_WORKERS = 6                 # fewer parallel requests = fewer timeouts on home connections
 CONNECT_TIMEOUT = 8
 READ_TIMEOUT = 20
 RETRY_READ_TIMEOUT = 40         # second attempt is more patient
 RETRY_DELAY = 1.5
 ARTICLE_TIMEOUT = 6              # connect/read timeout per socket operation
 ARTICLE_DEADLINE = 10            # hard limit for the whole download, in seconds
-ARTICLE_MAX_BYTES = 1_500_000
-ARTICLE_CACHE_MAX = 200
+ARTICLE_MAX_BYTES = 700_000
+ARTICLE_CACHE_MAX = 60
 ARTICLE_CACHE_OK_SECS = 6 * 3600
 ARTICLE_CACHE_FALLBACK_SECS = 300
 # --- abuse protection and hardening
@@ -57,7 +58,7 @@ LIMIT_NEWS = "60 per minute"
 LIMIT_ARTICLE = "20 per minute;200 per hour"
 LIMIT_REFRESH = "3 per 10 minutes"
 REFRESH_COOLDOWN_SECS = 60       # site-wide: no manual refresh right after any refresh attempt
-ARTICLE_MAX_CONCURRENT = 3       # simultaneous article downloads, so slow sites cannot use every thread
+ARTICLE_MAX_CONCURRENT = 2       # simultaneous article downloads, so slow sites cannot use every thread
 ARTICLE_QUEUE_WAIT = 2           # seconds a request waits for a free download slot
 MAX_REDIRECTS = 3
 ALLOWED_PORTS = {None, 80, 443}
@@ -215,9 +216,20 @@ def _retryable(exc):
 
 def _fetch_feed(category, feed, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT)):
     started = time.time()
-    resp = requests.get(feed["url"], headers={"User-Agent": USER_AGENT, "Accept": ACCEPT}, timeout=timeout)
-    resp.raise_for_status()
-    parsed = feedparser.parse(resp.content)
+    resp = requests.get(feed["url"], headers={"User-Agent": USER_AGENT, "Accept": ACCEPT},
+                        timeout=timeout, stream=True)
+    try:
+        resp.raise_for_status()
+        # Cap the download: a few feeds are several MB and parsing them is what uses memory.
+        body = bytearray()
+        for chunk in resp.iter_content(65536):
+            body.extend(chunk)
+            if len(body) >= FEED_MAX_BYTES:
+                break
+    finally:
+        resp.close()
+    parsed = feedparser.parse(bytes(body))
+    del body
     limit = feed.get("limit", DEFAULT_PER_FEED)
     items = []
     for e in parsed.entries[:limit]:
@@ -226,7 +238,7 @@ def _fetch_feed(category, feed, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT)):
         # Only plain web links are allowed (blocks javascript:, data: and file: links from a hostile feed).
         if not link or not link.lower().startswith(("http://", "https://")) or not title:
             continue
-        summary = _strip_html(e.get("summary", ""))[:500]
+        summary = _strip_html(e.get("summary", "")[:4000])[:500]
         cats = classify(category, title, summary)
         level, badges, cves = assess(title, summary)
         items.append({
