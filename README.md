@@ -58,7 +58,8 @@ Four themes: Midnight, Newsroom, Daylight and Command (the original green termin
 
 ## Features
 
-- 74 sources, refreshed every 10 minutes, with first results shown while the slow ones finish loading
+- 74 sources. The server refreshes itself every 10 minutes in the background, so the page is already current
+  when you open it. Stories older than 14 days are hidden.
 - Automatic retries for timeouts, rate limits and server errors
 - Source health panel showing which feeds worked and why any failed
 - Country tagging by keyword, including threat actor names (Lazarus maps to North Korea, Volt Typhoon to China)
@@ -89,7 +90,8 @@ app.py     Flask server: fetches feeds, classifies stories, serves the API and t
 static/    plain JavaScript front end, d3 map, themes, bundled fonts and flags
 ```
 
-1. Feeds are fetched in parallel (8 at a time) and cached in memory.
+1. A background timer fetches feeds in parallel (6 at a time) every 10 minutes and caches them in memory. A
+   refresh has a 4 minute limit, so one source that never answers cannot freeze it.
 2. Each feed has a main category. Keyword rules add more.
 3. `assess()` scores each story for severity and extracts CVE ids. `detect_countries()` tags countries by
    earliest mention.
@@ -97,7 +99,8 @@ static/    plain JavaScript front end, d3 map, themes, bundled fonts and flags
 
 | Route | Purpose |
 | --- | --- |
-| `GET /api/news` | Stories, tab labels, country list, source health |
+| `GET /api/news` | Stories, tab labels, country list, source health (compressed, cached for 2 seconds) |
+| `GET /healthz` | Health check for the host: story count and last update time |
 | `POST /api/refresh` | Force a refresh |
 | `GET /api/article/<id>` | Readable text for a story that is in the feed cache |
 
@@ -118,6 +121,10 @@ static/    plain JavaScript front end, d3 map, themes, bundled fonts and flags
   script. Feed links are limited to http and https.
 - Strict Content-Security-Policy (`default-src 'self'`) and no inline scripts.
 - Saved stories are validated when read back, so tampered browser storage cannot inject markup.
+- The reader checks every redirect and refuses any address that points to a private or internal network.
+- Rate limits on the news, article and refresh routes, a cooldown on refresh, and a cap on simultaneous
+  article downloads.
+- HSTS forces HTTPS on the live site, and feed downloads and article pages are size capped.
 - The server binds to localhost by default.
 
 ## Limits
@@ -137,8 +144,8 @@ for example:
 - Build command: `pip install -r requirements.txt`
 - Start command: `gunicorn app:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120`
 
-Keep one worker, because the feed cache lives in memory. Rate limit `POST /api/refresh` and
-`/api/article/<id>` before sharing the link widely.
+Keep one worker, because the feed cache lives in memory. Set the health check path to `/healthz`. Optional
+settings: `REFRESH_SECS` (how often the server refreshes, default 600) and `MAX_AGE_DAYS` (default 14).
 
 
 
@@ -148,20 +155,20 @@ Keep one worker, because the feed cache lives in memory. Rate limit `POST /api/r
 | --- | --- |
 | Nov 5, 2026 | First public release. Repo published on GitHub and deployed live on Render. |
 | Nov 7, 2026 | Upgraded the Render compute plan so the site stays running with no sleep or boot-up downtime, and gets more CPU. |
+| Nov 13, 2026 | The server now refreshes itself every 10 minutes in the background, so the page is current when you open it, even after days away. |
+| Nov 13, 2026 | Added rate limits on the news, article and refresh routes to protect the server from heavy or abusive traffic. |
+| Nov 13, 2026 | The article reader now checks every redirect and blocks private network addresses. |
+| Nov 13, 2026 | Added a `/healthz` health check, HSTS, compressed and briefly cached news responses, and pinned dependency versions. |
+| Nov 13, 2026 | A refresh now has a 4 minute time limit, and progress is written to the server logs. |
+| Nov 13, 2026 | Stories older than 14 days are no longer shown. |
+| Nov 13, 2026 | Fixed the server running out of memory by capping feed and article download sizes and limiting parallel work. |
+
 ## Next features
 
 ### In progress
 
-- **Rate limiting.** Per-visitor limits on the article reader, the refresh button and the news endpoint, plus a
-  site-wide cooldown on refresh and a cap on simultaneous article downloads. Visitors who go over the limit see
-  a friendly message instead of an error.
-- **Stronger SSRF protection.** The reader already fetches only links from its own feed cache. Next, it will
-  also check every redirect and refuse any address that points to a private or internal network.
-- **Health check endpoint.** A lightweight `/healthz` route so the host can confirm the app is running and
-  restart it if it stops responding.
-- **Security headers.** Adding HSTS to force HTTPS, on top of the existing Content-Security-Policy.
-- **Faster API.** Compressing and briefly caching the news response so many visitors cost the server one
-  computation.
+- **Watching memory use.** Checking the Render memory graph after today's fixes to confirm it stays well under
+  the 512 MB limit.
 
 ### Planned
 
