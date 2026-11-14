@@ -35,6 +35,7 @@ warnings.filterwarnings("ignore", category=MarkupResemblesLocatorWarning)
 
 CACHE_TTL = int(os.environ.get("REFRESH_SECS", 600))  # seconds between feed refreshes
 MIN_RETRY_SECS = 60  # a failed refresh is not retried more often than this
+MAX_AGE_DAYS = int(os.environ.get("MAX_AGE_DAYS", 14))  # older stories are not shown
 REFRESH_DEADLINE = 240  # a refresh that is still running after this many seconds is cut off
 START_DELAY_SECS = float(os.environ.get("START_DELAY_SECS", 2))  # wait after startup before the first refresh
 DEFAULT_PER_FEED = 15
@@ -275,6 +276,8 @@ def _publish(items, health, final=False):
         seen.add(it["link"])
         if it["ts"] > now + 3600:  # clamp future-dated items
             it["ts"] = int(now)
+        if it["ts"] < now - MAX_AGE_DAYS * 86400:  # too old, or no date at all
+            continue
         unique.append(it)
     with _lock:
         _cache["items"] = unique[:MAX_ITEMS]
