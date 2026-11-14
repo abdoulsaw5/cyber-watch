@@ -35,6 +35,8 @@ warnings.filterwarnings("ignore", category=MarkupResemblesLocatorWarning)
 
 CACHE_TTL = int(os.environ.get("REFRESH_SECS", 600))  # seconds between feed refreshes
 MIN_RETRY_SECS = 60  # a failed refresh is not retried more often than this
+REFRESH_DEADLINE = 240  # a refresh that is still running after this many seconds is cut off
+START_DELAY_SECS = float(os.environ.get("START_DELAY_SECS", 2))  # wait after startup before the first refresh
 DEFAULT_PER_FEED = 15
 MAX_ITEMS = 1500
 MAX_WORKERS = 8                 # fewer parallel requests = fewer timeouts on home connections
@@ -254,6 +256,11 @@ def _fetch_with_retry(category, feed):
         return _fetch_feed(category, feed, (CONNECT_TIMEOUT + 4, RETRY_READ_TIMEOUT))
 
 
+def _log(msg):
+    """One-line messages that show up in the host's log viewer."""
+    print(f"[cyberwatch] {msg}", flush=True)
+
+
 def _invalidate_news():
     with _news_lock:
         _news_cache.clear()
@@ -279,15 +286,18 @@ def _publish(items, health, final=False):
 
 def _do_refresh():
     global _refreshing
+    began = time.time()
+    _log("refresh started")
     try:
         # First load: show stories as sources arrive. Later refreshes swap in at the end
         # so the list never shrinks while it is working.
         progressive = not _cache["items"]
         jobs = [(cat, f) for cat, feeds in FEEDS.items() for f in feeds]
         items, health = [], {}
-        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
-            futures = {pool.submit(_fetch_with_retry, cat, f): (cat, f) for cat, f in jobs}
-            for fut in as_completed(futures):
+        pool = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+        futures = {pool.submit(_fetch_with_retry, cat, f): (cat, f) for cat, f in jobs}
+        try:
+            for fut in as_completed(futures, timeout=REFRESH_DEADLINE):
                 cat, f = futures[fut]
                 try:
                     got, ms = fut.result()
@@ -301,6 +311,14 @@ def _do_refresh():
                     health[f["name"]] = {"ok": False, "error": _short_error(exc), "count": 0, "category": cat}
                 if progressive:
                     _publish(items, health)
+        except TimeoutError:
+            # Safety net: a feed that never answers must not freeze the whole refresh.
+            for fut, (cat, f) in futures.items():
+                if f["name"] not in health:
+                    health[f["name"]] = {"ok": False, "error": "Timed out", "count": 0, "category": cat}
+            _log(f"refresh hit the {REFRESH_DEADLINE}s limit, some feeds never answered")
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
         if items or not _cache["items"]:
             _publish(items, health, final=True)
         else:
@@ -309,6 +327,11 @@ def _do_refresh():
             with _lock:
                 _cache["health"] = dict(health)
             _invalidate_news()
+        good = sum(1 for h in health.values() if h.get("ok"))
+        _log(f"refresh finished: {len(items)} stories, {good}/{len(jobs)} feeds ok, {time.time() - began:.0f}s")
+    except Exception as exc:  # noqa: BLE001
+        _log(f"refresh crashed: {type(exc).__name__}: {exc}")
+        raise
     finally:
         with _lock:
             _refreshing = False
@@ -336,11 +359,12 @@ def _ensure_fresh():
 
 
 def _scheduler_loop():
+    time.sleep(START_DELAY_SECS)
     while True:
         try:
             start_refresh()
-        except Exception:  # noqa: BLE001  the timer must never die
-            pass
+        except Exception as exc:  # noqa: BLE001  the timer must never die
+            _log(f"scheduler error: {type(exc).__name__}: {exc}")
         time.sleep(CACHE_TTL)
 
 
@@ -357,10 +381,8 @@ def start_scheduler():
             return False
         _scheduler_started = True
     threading.Thread(target=_scheduler_loop, name="feed-scheduler", daemon=True).start()
+    _log(f"scheduler started, refreshing every {CACHE_TTL}s")
     return True
-
-
-start_scheduler()
 
 
 # -------------------------------------------------------------------- routes
@@ -616,6 +638,9 @@ def _pick_port():
         except OSError:
             continue
     raise SystemExit("No free port found. Set one yourself, for example: set PORT=8123")
+
+
+start_scheduler()  # last, so the whole module is loaded before any background work begins
 
 
 if __name__ == "__main__":
